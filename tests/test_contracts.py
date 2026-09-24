@@ -4,7 +4,7 @@ import unittest
 from copy import deepcopy
 from pathlib import Path
 
-from robot_trials.contracts import Observation, Protocol, ValidationError
+from robot_trials.contracts import Observation, Protocol, ValidationError, parse_comparison_rules
 from robot_trials.jsonio import load_json
 
 
@@ -56,6 +56,45 @@ class ContractTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValidationError, "必须是 0 或 1"):
             Observation.from_dict(raw, self.protocol)
+
+    def _rules(self) -> list[dict[str, str]]:
+        return [
+            {"metric": "completed", "type": "non_inferior", "margin": "0.1"},
+            {"metric": "completion_seconds", "type": "superior", "margin": "0"},
+            {"metric": "interventions", "type": "non_inferior", "margin": "1"},
+        ]
+
+    def test_comparison_rules_follow_protocol_metric_order(self) -> None:
+        rules = parse_comparison_rules(list(reversed(self._rules())), self.protocol)
+        self.assertEqual(
+            [rule.metric for rule in rules],
+            ["completed", "completion_seconds", "interventions"],
+        )
+        self.assertEqual(rules[0].as_dict(), {"metric": "completed", "type": "non_inferior", "margin": "0.1"})
+
+    def test_comparison_rules_must_cover_every_metric(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "覆盖全部协议指标"):
+            parse_comparison_rules(self._rules()[:1], self.protocol)
+
+    def test_comparison_rules_reject_unknown_metric_and_bad_margin(self) -> None:
+        rules = self._rules()
+        rules[0] = {"metric": "unknown", "type": "superior", "margin": "0"}
+        with self.assertRaisesRegex(ValidationError, "未在协议中声明"):
+            parse_comparison_rules(rules, self.protocol)
+        rules = self._rules()
+        rules[0] = {"metric": "completed", "type": "non_inferior", "margin": "0"}
+        with self.assertRaisesRegex(ValidationError, "必须大于零"):
+            parse_comparison_rules(rules, self.protocol)
+        rules = self._rules()
+        rules[1] = {"metric": "completion_seconds", "type": "superior", "margin": "-1"}
+        with self.assertRaisesRegex(ValidationError, "不能为负"):
+            parse_comparison_rules(rules, self.protocol)
+
+    def test_comparison_rules_reject_duplicates(self) -> None:
+        rules = self._rules()
+        rules.append({"metric": "completed", "type": "superior", "margin": "0"})
+        with self.assertRaisesRegex(ValidationError, "重复"):
+            parse_comparison_rules(rules, self.protocol)
 
 
 if __name__ == "__main__":

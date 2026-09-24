@@ -248,3 +248,48 @@ class Observation:
             metrics=parsed,
             excluded_reason=_optional_text(data.get("excluded_reason"), "observation.excluded_reason"),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ComparisonRule:
+    """对照分析中针对单个指标预先声明的非劣或优效规则。"""
+
+    metric: str
+    rule_type: str
+    margin: Decimal
+
+    def as_dict(self) -> dict[str, str]:
+        return {"metric": self.metric, "type": self.rule_type, "margin": format(self.margin, "f")}
+
+
+def parse_comparison_rules(raw: object, protocol: Protocol) -> tuple[ComparisonRule, ...]:
+    """校验对照规则；规则必须逐一覆盖协议全部指标且不重复。"""
+
+    items = _require_sequence(raw, "comparison.rules")
+    if not items:
+        raise ValidationError("comparison.rules 不能为空")
+    rules: list[ComparisonRule] = []
+    seen: set[str] = set()
+    for index, item in enumerate(items):
+        path = f"comparison.rules[{index}]"
+        data = _require_mapping(item, path)
+        metric = _required_text(data.get("metric"), f"{path}.metric")
+        if metric not in protocol.metric_map:
+            raise ValidationError(f"{path}.metric 未在协议中声明")
+        rule_type = _required_text(data.get("type"), f"{path}.type")
+        if rule_type not in {"non_inferior", "superior"}:
+            raise ValidationError(f"{path}.type 必须是 non_inferior 或 superior")
+        margin = _decimal(data.get("margin"), f"{path}.margin")
+        if margin < 0:
+            raise ValidationError(f"{path}.margin 不能为负")
+        if rule_type == "non_inferior" and margin <= 0:
+            raise ValidationError(f"{path}.margin 对非劣规则必须大于零")
+        if metric in seen:
+            raise ValidationError(f"{path}.metric 重复")
+        seen.add(metric)
+        rules.append(ComparisonRule(metric=metric, rule_type=rule_type, margin=margin))
+    missing = sorted(set(protocol.metric_map) - seen)
+    if missing:
+        raise ValidationError(f"comparison.rules 必须覆盖全部协议指标，缺少 {missing}")
+    order = {metric.key: position for position, metric in enumerate(protocol.metrics)}
+    return tuple(sorted(rules, key=lambda rule: order[rule.metric]))

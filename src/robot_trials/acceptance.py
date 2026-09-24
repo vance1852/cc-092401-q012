@@ -46,11 +46,44 @@ def run(workspace: Path) -> dict[str, object]:
             service.decide(
                 "approver-1", "batch-demo", analysis["analysis_id"], decision_value, "离线验收决定"
             )
+            service.register_build("operator-1", "build-a2", "robot-a", "1.1.0", "c" * 64)
+            service.create_batch(
+                "operator-1", "batch-demo-2", protocol["protocol_id"], protocol["version"], "build-a2"
+            )
+            service.start_batch("operator-1", "batch-demo-2", 1)
+            service.import_observations("operator-1", "batch-demo-2", "demo-import-2", observation_rows)
+            service.seal_batch("stat-1", "batch-demo-2", 2)
+            candidate_job = service.claim_job("worker-1", lease_seconds=60)
+            if candidate_job is None:
+                raise RuntimeError("未能领取候选批次分析任务")
+            candidate_analysis = service.complete_job("worker-1", candidate_job["job_id"], "stat-1")
+            candidate_decision = (
+                "approved" if candidate_analysis["result"]["conclusion"] == "pass" else "rejected"
+            )
+            service.decide(
+                "approver-1", "batch-demo-2", candidate_analysis["analysis_id"],
+                candidate_decision, "离线验收决定",
+            )
+            comparison_rules = [
+                {"metric": "completed", "type": "non_inferior", "margin": "0.6"},
+                {"metric": "completion_seconds", "type": "non_inferior", "margin": "10"},
+                {"metric": "interventions", "type": "non_inferior", "margin": "1.5"},
+            ]
+            comparison = service.create_comparison(
+                "stat-1", "batch-demo", "batch-demo-2", comparison_rules
+            )
+            replayed = service.create_comparison(
+                "stat-1", "batch-demo", "batch-demo-2", comparison_rules
+            )
+            if not replayed["replayed"] or replayed["comparison_id"] != comparison["comparison_id"]:
+                raise RuntimeError("对照分析幂等重算失败")
             report = service.report("auditor-1", "batch-demo")
+            if len(report["comparisons"]) != 1:
+                raise RuntimeError("对照分析未进入批次报告")
             schema = inspect_schema(connection)
         finally:
             connection.close()
-    if schema["missing_tables"] or schema["schema_version"] != "2":
+    if schema["missing_tables"] or schema["schema_version"] != "3":
         raise RuntimeError("SQLite 基础结构检查失败")
     return {
         "status": "ok",
@@ -60,6 +93,8 @@ def run(workspace: Path) -> dict[str, object]:
         "input_sha256": analysis["input_sha256"],
         "conclusion": analysis["result"]["conclusion"],
         "decision": report["decision"]["decision"],
+        "comparison_id": comparison["comparison_id"],
+        "comparison_conclusion": comparison["result"]["conclusion"],
         "event_count": len(report["events"]),
         "schema": schema,
     }

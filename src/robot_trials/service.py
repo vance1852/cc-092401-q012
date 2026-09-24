@@ -10,7 +10,8 @@ from typing import Any, Iterable, Mapping
 
 from .analysis import ALGORITHM_VERSION, analyze
 from .clock import SystemClock, isoformat
-from .contracts import Observation, Protocol, ValidationError
+from .comparison import COMPARISON_ALGORITHM_VERSION, compare
+from .contracts import Observation, Protocol, ValidationError, parse_comparison_rules
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
 from .jsonio import canonical_json, content_digest
 from .storage import initialize, transaction
@@ -21,7 +22,7 @@ ROLE_PERMISSIONS = {
         "catalog.write", "batch.create", "batch.start", "observation.import",
         "exclusion.request", "exclusion.revoke",
     },
-    "statistician": {"protocol.publish", "batch.seal", "exclusion.review", "analysis.run"},
+    "statistician": {"protocol.publish", "batch.seal", "exclusion.review", "analysis.run", "comparison.run"},
     "approver": {"decision.write"},
     "auditor": {"report.read", "audit.read"},
 }
@@ -407,17 +408,11 @@ class TrialService:
             ))
         return tuple(items)
 
-    def complete_job(self, worker_id: str, job_id: int, statistician_id: str) -> dict[str, Any]:
-        self._require(statistician_id, "analysis.run")
-        job = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)).fetchone()
-        if job is None:
-            raise NotFound("分析任务不存在")
-        if job["state"] != "leased" or job["lease_owner"] != worker_id:
-            raise InvalidState("任务未由当前工作进程持有")
-        if job["lease_expires_at"] <= self._now():
-            raise InvalidState("任务租约已经过期")
-        batch = self.get_batch(job["batch_id"])
-        protocol, protocol_digest = self._protocol(batch["protocol_id"], batch["protocol_version"])
+    def _analysis_input(
+        self, batch: Mapping[str, Any], protocol: Protocol
+    ) -> tuple[tuple[Observation, ...], str]:
+        """重放某批次当前观测与排除状态，返回观测序列及其冻结输入摘要。"""
+
         observations = self._analysis_observations(batch["batch_id"], protocol)
         snapshot_rows = [
             {
@@ -429,7 +424,20 @@ class TrialService:
             }
             for item in observations
         ]
-        input_digest = content_digest(snapshot_rows)
+        return observations, content_digest(snapshot_rows)
+
+    def complete_job(self, worker_id: str, job_id: int, statistician_id: str) -> dict[str, Any]:
+        self._require(statistician_id, "analysis.run")
+        job = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)).fetchone()
+        if job is None:
+            raise NotFound("分析任务不存在")
+        if job["state"] != "leased" or job["lease_owner"] != worker_id:
+            raise InvalidState("任务未由当前工作进程持有")
+        if job["lease_expires_at"] <= self._now():
+            raise InvalidState("任务租约已经过期")
+        batch = self.get_batch(job["batch_id"])
+        protocol, protocol_digest = self._protocol(batch["protocol_id"], batch["protocol_version"])
+        observations, input_digest = self._analysis_input(batch, protocol)
         result = analyze(protocol, observations)
         with transaction(self.connection, immediate=True):
             existing = self.connection.execute(
@@ -514,6 +522,188 @@ class TrialService:
             raise Conflict("该分析版本已经形成决定") from exc
         return {"batch_id": batch_id, "analysis_id": analysis_id, "decision": decision}
 
+    def _current_analysis(self, batch: Mapping[str, Any]) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM analyses WHERE batch_id=? AND batch_revision=? ORDER BY analysis_id DESC LIMIT 1",
+            (batch["batch_id"], batch["revision"]),
+        ).fetchone()
+        if row is None:
+            raise InvalidState("批次缺少对当前版本的分析")
+        return row
+
+    def _comparison_response(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "comparison_id": row["comparison_id"],
+            "baseline_batch_id": row["baseline_batch_id"],
+            "candidate_batch_id": row["candidate_batch_id"],
+            "baseline_analysis_id": row["baseline_analysis_id"],
+            "candidate_analysis_id": row["candidate_analysis_id"],
+            "algorithm_version": row["algorithm_version"],
+            "spec_sha256": row["spec_sha256"],
+            "input_sha256": row["input_sha256"],
+            "spec": json.loads(row["spec_json"]),
+            "result": json.loads(row["result_json"]),
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+        }
+
+    def create_comparison(
+        self,
+        actor_id: str,
+        baseline_batch_id: str,
+        candidate_batch_id: str,
+        raw_rules: Iterable[Mapping[str, Any]],
+        baseline_analysis_id: int | None = None,
+        candidate_analysis_id: int | None = None,
+    ) -> dict[str, Any]:
+        """对两个已封存批次做对照分析；相同冻结输入与规则幂等重算。"""
+
+        self._require(actor_id, "comparison.run")
+        if baseline_batch_id == candidate_batch_id:
+            raise ValidationFailed("对照需要两个不同的批次")
+        baseline = self.get_batch(baseline_batch_id)
+        candidate = self.get_batch(candidate_batch_id)
+        for batch in (baseline, candidate):
+            if batch["state"] not in {"analyzed", "decided"}:
+                raise InvalidState("批次必须已封存并完成当前分析")
+        if (baseline["protocol_id"], baseline["protocol_version"]) != (
+            candidate["protocol_id"],
+            candidate["protocol_version"],
+        ):
+            raise ValidationFailed("两个批次的协议版本不兼容")
+        protocol, protocol_digest = self._protocol(baseline["protocol_id"], baseline["protocol_version"])
+        models = {
+            self.connection.execute(
+                "SELECT r.model_name FROM batches b JOIN builds u ON u.build_id=b.build_id "
+                "JOIN robots r ON r.robot_id=u.robot_id WHERE b.batch_id=?",
+                (batch["batch_id"],),
+            ).fetchone()["model_name"]
+            for batch in (baseline, candidate)
+        }
+        if len(models) != 1:
+            raise ValidationFailed("两个批次的机器人型号不兼容")
+        try:
+            rules = parse_comparison_rules(tuple(raw_rules), protocol)
+        except ValidationError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        analyses: dict[str, sqlite3.Row] = {}
+        observations: dict[str, tuple[Observation, ...]] = {}
+        for label, batch, requested in (
+            ("baseline", baseline, baseline_analysis_id),
+            ("candidate", candidate, candidate_analysis_id),
+        ):
+            current = self._current_analysis(batch)
+            if requested is not None:
+                try:
+                    requested_id = int(requested)
+                except (TypeError, ValueError) as exc:
+                    raise ValidationFailed("分析版本编号必须是整数") from exc
+                if requested_id != current["analysis_id"]:
+                    raise InvalidState("引用了非当前分析版本")
+            if current["protocol_sha256"] != protocol_digest:
+                raise InvalidState("分析对应的协议内容摘要不一致")
+            rows, input_digest = self._analysis_input(batch, protocol)
+            if input_digest != current["input_sha256"]:
+                raise InvalidState("批次观测或排除已变化，分析输入不再冻结")
+            analyses[label] = current
+            observations[label] = rows
+        spec = {
+            "baseline": {
+                "batch_id": baseline["batch_id"],
+                "analysis_id": analyses["baseline"]["analysis_id"],
+                "input_sha256": analyses["baseline"]["input_sha256"],
+            },
+            "candidate": {
+                "batch_id": candidate["batch_id"],
+                "analysis_id": analyses["candidate"]["analysis_id"],
+                "input_sha256": analyses["candidate"]["input_sha256"],
+            },
+            "rules": [rule.as_dict() for rule in rules],
+        }
+        spec_digest = content_digest([spec])
+        input_digest = content_digest([
+            {
+                "algorithm_version": COMPARISON_ALGORITHM_VERSION,
+                "protocol_sha256": protocol_digest,
+                "spec": spec,
+            }
+        ])
+        lookup = (
+            analyses["baseline"]["analysis_id"],
+            analyses["candidate"]["analysis_id"],
+            spec_digest,
+        )
+        replayed = False
+        with transaction(self.connection, immediate=True):
+            existing = self.connection.execute(
+                "SELECT * FROM comparisons WHERE baseline_analysis_id=? AND candidate_analysis_id=? AND spec_sha256=?",
+                lookup,
+            ).fetchone()
+            if existing is None:
+                result = compare(protocol, observations["baseline"], observations["candidate"], rules)
+                try:
+                    cursor = self.connection.execute(
+                        "INSERT INTO comparisons(baseline_batch_id,candidate_batch_id,baseline_analysis_id,"
+                        "candidate_analysis_id,spec_json,spec_sha256,input_sha256,algorithm_version,result_json,"
+                        "created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            baseline["batch_id"],
+                            candidate["batch_id"],
+                            analyses["baseline"]["analysis_id"],
+                            analyses["candidate"]["analysis_id"],
+                            canonical_json(spec),
+                            spec_digest,
+                            input_digest,
+                            COMPARISON_ALGORITHM_VERSION,
+                            canonical_json(result),
+                            actor_id,
+                            self._now(),
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    existing = self.connection.execute(
+                        "SELECT * FROM comparisons WHERE baseline_analysis_id=? AND candidate_analysis_id=? "
+                        "AND spec_sha256=?",
+                        lookup,
+                    ).fetchone()
+                    if existing is None:
+                        raise Conflict("对照分析创建冲突")
+                    replayed = True
+                else:
+                    comparison_id = cursor.lastrowid
+                    self._audit(
+                        "comparison",
+                        str(comparison_id),
+                        "comparison.created",
+                        actor_id,
+                        {
+                            "baseline_batch_id": baseline["batch_id"],
+                            "candidate_batch_id": candidate["batch_id"],
+                            "spec_sha256": spec_digest,
+                            "input_sha256": input_digest,
+                            "conclusion": result["conclusion"],
+                        },
+                    )
+                    existing = self.connection.execute(
+                        "SELECT * FROM comparisons WHERE comparison_id=?", (comparison_id,)
+                    ).fetchone()
+            else:
+                replayed = True
+        response = self._comparison_response(existing)
+        response["replayed"] = replayed
+        return response
+
+    def get_comparison(self, actor_id: str, comparison_id: int) -> dict[str, Any]:
+        user = self._user(actor_id)
+        if user["role"] not in {"statistician", "approver", "auditor"}:
+            raise Forbidden("当前角色不能读取对照分析")
+        row = self.connection.execute(
+            "SELECT * FROM comparisons WHERE comparison_id=?", (comparison_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("对照分析不存在")
+        return self._comparison_response(row)
+
     def report(self, actor_id: str, batch_id: str) -> dict[str, Any]:
         user = self._user(actor_id)
         if user["role"] not in {"statistician", "approver", "auditor"}:
@@ -538,6 +728,10 @@ class TrialService:
             "WHERE entity_type='batch' AND entity_id=? "
             "ORDER BY event_id", (batch_id,)
         ).fetchall()
+        comparison_rows = self.connection.execute(
+            "SELECT * FROM comparisons WHERE baseline_batch_id=? OR candidate_batch_id=? "
+            "ORDER BY comparison_id", (batch_id, batch_id)
+        ).fetchall()
         return {
             "batch": batch,
             "protocol": {
@@ -556,5 +750,12 @@ class TrialService:
             },
             "decision": None if decision_row is None else dict(decision_row),
             "exclusions": [dict(row) for row in exclusions],
+            "comparisons": [
+                {
+                    **self._comparison_response(row),
+                    "role": "baseline" if row["baseline_batch_id"] == batch_id else "candidate",
+                }
+                for row in comparison_rows
+            ],
             "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
         }

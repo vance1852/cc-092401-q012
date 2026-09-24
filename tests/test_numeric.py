@@ -5,7 +5,14 @@ from decimal import Decimal
 from pathlib import Path
 
 from robot_trials.jsonio import load_observations, load_protocol
-from robot_trials.numeric import group_metric, summarize, wilson_interval
+from robot_trials.numeric import (
+    group_metric,
+    newcombe_difference_interval,
+    pooled_effect_size,
+    quantile,
+    summarize,
+    wilson_interval,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +43,28 @@ class NumericTests(unittest.TestCase):
         grouped = group_metric(rows, "completion_seconds")
         self.assertEqual(grouped["clear-aisle"].count, 3)
         self.assertEqual(grouped["cross-traffic"].count, 3)
+
+    def test_quantile_interpolates(self) -> None:
+        values = [Decimal("1"), Decimal("2"), Decimal("3"), Decimal("4")]
+        self.assertEqual(quantile(values, Decimal("0.5")), Decimal("2.5"))
+        self.assertEqual(quantile(values, Decimal("0")), Decimal("1"))
+        self.assertEqual(quantile(values, Decimal("1")), Decimal("4"))
+
+    def test_newcombe_interval_tracks_difference(self) -> None:
+        interval = newcombe_difference_interval(6, 6, 3, 6)
+        self.assertAlmostEqual(interval.difference, 0.5)
+        self.assertGreater(interval.lower, 0)
+        self.assertLess(interval.upper, 1)
+        same = newcombe_difference_interval(3, 6, 3, 6)
+        self.assertLess(same.lower, 0)
+        self.assertGreater(same.upper, 0)
+
+    def test_pooled_effect_size(self) -> None:
+        first = summarize([1, 2, 3])
+        second = summarize([3, 4, 5])
+        self.assertEqual(pooled_effect_size(first, second), Decimal(-2))
+        self.assertIsNone(pooled_effect_size(summarize([1]), second))
+        self.assertIsNone(pooled_effect_size(summarize([2, 2]), summarize([3, 3])))
 
 
 if __name__ == "__main__":

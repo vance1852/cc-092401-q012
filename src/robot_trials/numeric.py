@@ -46,6 +46,35 @@ class WilsonInterval:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class DifferenceInterval:
+    """两个独立样本比例差的区间估计。"""
+
+    difference: float
+    lower: float
+    upper: float
+
+    def as_dict(self) -> dict[str, float]:
+        return {
+            "difference": round(self.difference, 12),
+            "lower": round(self.lower, 12),
+            "upper": round(self.upper, 12),
+        }
+
+
+def quantile(values: Iterable[Decimal], probability: Decimal) -> Decimal:
+    """按线性插值计算分位数，输入不能为空。"""
+
+    ordered = sorted(values)
+    if not ordered:
+        raise ValueError("分位数输入不能为空")
+    position = probability * Decimal(len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - Decimal(lower)
+    return ordered[lower] * (Decimal(1) - fraction) + ordered[upper] * fraction
+
+
 def summarize(values: Iterable[Decimal | int | str]) -> NumericSummary:
     """计算有限数值的稳定摘要，方差使用 n-1 分母。"""
 
@@ -103,6 +132,47 @@ def wilson_interval(successes: int, trials: int, z: float = 1.959963984540054) -
         lower=max(0.0, center - radius),
         upper=min(1.0, center + radius),
     )
+
+
+def newcombe_difference_interval(
+    successes_a: int,
+    trials_a: int,
+    successes_b: int,
+    trials_b: int,
+    z: float = 1.959963984540054,
+) -> DifferenceInterval:
+    """Newcombe 混合评分区间，估计比例差 p_a - p_b（两组独立）。"""
+
+    first = wilson_interval(successes_a, trials_a, z)
+    second = wilson_interval(successes_b, trials_b, z)
+    proportion_a = successes_a / trials_a
+    proportion_b = successes_b / trials_b
+    difference = proportion_a - proportion_b
+    lower = difference - math.sqrt(
+        (proportion_a - first.lower) ** 2 + (second.upper - proportion_b) ** 2
+    )
+    upper = difference + math.sqrt(
+        (first.upper - proportion_a) ** 2 + (proportion_b - second.lower) ** 2
+    )
+    return DifferenceInterval(
+        difference=difference,
+        lower=max(-1.0, lower),
+        upper=min(1.0, upper),
+    )
+
+
+def pooled_effect_size(a: NumericSummary, b: NumericSummary) -> Decimal | None:
+    """Cohen's d = (mean_a - mean_b) / 合并标准差；方差缺失或合并标准差为零时返回 None。"""
+
+    if a.sample_variance is None or b.sample_variance is None:
+        return None
+    degrees = (a.count - 1) + (b.count - 1)
+    pooled = (
+        (a.count - 1) * a.sample_variance + (b.count - 1) * b.sample_variance
+    ) / Decimal(degrees)
+    if pooled <= 0:
+        return None
+    return (a.mean - b.mean) / pooled.sqrt()
 
 
 def group_metric(

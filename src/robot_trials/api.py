@@ -133,6 +133,15 @@ class JsonApplication:
                     payload["decision"], payload["reason"],
                 )
                 return Response(201, result)
+            if method == "POST" and path == "/comparisons":
+                result = self.service.compare_batches(
+                    self._actor(normalized_headers), payload["baseline_batch_id"],
+                    payload["candidate_batch_id"], int(payload["baseline_analysis_id"]),
+                    int(payload["candidate_analysis_id"]), {"rules": payload.get("rules", [])},
+                )
+                return Response(201 if result["created"] else 200, result)
+            if method == "GET" and len(parts) == 2 and parts[0] == "comparisons":
+                return Response(200, self.service.get_comparison(self._actor(normalized_headers), int(parts[1])))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except ServiceError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})

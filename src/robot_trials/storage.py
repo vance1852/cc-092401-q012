@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -148,6 +148,24 @@ CREATE TABLE IF NOT EXISTS decisions (
     UNIQUE (batch_id, analysis_id)
 );
 
+CREATE TABLE IF NOT EXISTS comparisons (
+    comparison_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    baseline_batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+    candidate_batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+    baseline_analysis_id INTEGER NOT NULL REFERENCES analyses(analysis_id),
+    candidate_analysis_id INTEGER NOT NULL REFERENCES analyses(analysis_id),
+    protocol_sha256 TEXT NOT NULL CHECK (length(protocol_sha256) = 64),
+    input_sha256 TEXT NOT NULL CHECK (length(input_sha256) = 64),
+    rules_json TEXT NOT NULL,
+    rules_sha256 TEXT NOT NULL CHECK (length(rules_sha256) = 64),
+    algorithm_version TEXT NOT NULL,
+    seed INTEGER NOT NULL,
+    result_json TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE (baseline_batch_id, candidate_batch_id, baseline_analysis_id, candidate_analysis_id, rules_sha256)
+);
+
 CREATE TABLE IF NOT EXISTS audit_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL,
@@ -162,7 +180,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
 REQUIRED_TABLES = frozenset({
     "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "analyses", "decisions", "comparisons", "audit_events",
 })
 
 

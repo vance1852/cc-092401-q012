@@ -46,6 +46,19 @@ class WilsonInterval:
         }
 
 
+def quantile(values: Sequence[Decimal], probability: Decimal) -> Decimal:
+    """按线性插值计算有限样本的分位数。"""
+
+    ordered = sorted(values)
+    if not ordered:
+        raise ValueError("分位数输入不能为空")
+    position = probability * Decimal(len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - Decimal(lower)
+    return ordered[lower] * (Decimal(1) - fraction) + ordered[upper] * fraction
+
+
 def summarize(values: Iterable[Decimal | int | str]) -> NumericSummary:
     """计算有限数值的稳定摘要，方差使用 n-1 分母。"""
 

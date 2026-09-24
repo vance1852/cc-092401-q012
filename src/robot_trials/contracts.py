@@ -199,6 +199,55 @@ class Protocol:
 
 
 @dataclass(frozen=True, slots=True)
+class ComparisonRule:
+    """一条预先声明的对照判定规则（非劣或优效）。"""
+
+    metric: str
+    rule: str
+    margin: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: object, path: str, protocol: Protocol) -> "ComparisonRule":
+        data = _require_mapping(raw, path)
+        metric = _required_text(data.get("metric"), f"{path}.metric")
+        if metric not in protocol.metric_map:
+            raise ValidationError(f"{path}.metric 未在协议中声明")
+        rule = _required_text(data.get("rule"), f"{path}.rule")
+        if rule not in {"non_inferior", "superior"}:
+            raise ValidationError(f"{path}.rule 必须是 non_inferior 或 superior")
+        margin = _decimal(data.get("margin", "0"), f"{path}.margin")
+        if margin < 0:
+            raise ValidationError(f"{path}.margin 不能为负")
+        return cls(metric=metric, rule=rule, margin=margin)
+
+    def as_dict(self) -> dict[str, str]:
+        return {"metric": self.metric, "rule": self.rule, "margin": format(self.margin, "f")}
+
+
+@dataclass(frozen=True, slots=True)
+class ComparisonSpec:
+    """一次构建对照的全部预声明规则。"""
+
+    rules: tuple[ComparisonRule, ...]
+
+    @classmethod
+    def from_dict(cls, raw: object, protocol: Protocol) -> "ComparisonSpec":
+        data = _require_mapping(raw, "comparison")
+        rules = tuple(
+            ComparisonRule.from_dict(item, f"comparison.rules[{index}]", protocol)
+            for index, item in enumerate(_require_sequence(data.get("rules"), "comparison.rules"))
+        )
+        if not rules:
+            raise ValidationError("comparison.rules 不能为空")
+        if len({rule.metric for rule in rules}) != len(rules):
+            raise ValidationError("comparison.rules.metric 不能重复")
+        return cls(rules=rules)
+
+    def as_dict(self) -> dict[str, object]:
+        return {"rules": [rule.as_dict() for rule in self.rules]}
+
+
+@dataclass(frozen=True, slots=True)
 class Observation:
     """一次已结构化的机器人任务观测。"""
 

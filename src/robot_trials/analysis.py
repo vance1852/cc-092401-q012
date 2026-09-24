@@ -7,21 +7,10 @@ from decimal import Decimal
 from typing import Iterable, Mapping
 
 from .contracts import Metric, Observation, Protocol
-from .numeric import summarize, wilson_interval
+from .numeric import quantile, summarize, wilson_interval
 
 
 ALGORITHM_VERSION = "robot-trials-analysis/1"
-
-
-def _quantile(values: list[Decimal], probability: Decimal) -> Decimal:
-    ordered = sorted(values)
-    if not ordered:
-        raise ValueError("分位数输入不能为空")
-    position = probability * Decimal(len(ordered) - 1)
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    fraction = position - Decimal(lower)
-    return ordered[lower] * (Decimal(1) - fraction) + ordered[upper] * fraction
 
 
 def bootstrap_mean_interval(
@@ -35,7 +24,7 @@ def bootstrap_mean_interval(
     for _ in range(samples):
         total = sum((data[generator.randrange(len(data))] for _ in data), Decimal(0))
         means.append(total / Decimal(len(data)))
-    return _quantile(means, Decimal("0.025")), _quantile(means, Decimal("0.975"))
+    return quantile(means, Decimal("0.025")), quantile(means, Decimal("0.975"))
 
 
 def _metric_result(metric: Metric, values: list[Decimal], seed: int, samples: int) -> dict[str, object]:

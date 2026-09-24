@@ -5,11 +5,29 @@ from __future__ import annotations
 import argparse
 import json
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 
 from .jsonio import load_json
 from .service import TrialService
 from .storage import connect, inspect_schema
+
+
+def _improved_rows(observation_rows: list[dict]) -> list[dict]:
+    """构造一份相对基线略有改善的候选批次观测。"""
+
+    candidate_rows: list[dict] = []
+    for row in observation_rows:
+        updated = dict(row)
+        metrics = dict(row["metrics"])
+        metrics["completed"] = 1
+        metrics["completion_seconds"] = format(
+            Decimal(str(metrics["completion_seconds"])) - Decimal(5), "f"
+        )
+        metrics["interventions"] = 0
+        updated["metrics"] = metrics
+        candidate_rows.append(updated)
+    return candidate_rows
 
 
 def run(workspace: Path) -> dict[str, object]:
@@ -31,6 +49,7 @@ def run(workspace: Path) -> dict[str, object]:
             service.create_user("auditor-1", "审计人员", "auditor")
             service.register_robot("operator-1", "robot-a", "A 型人形机器人", "示例厂商")
             service.register_build("operator-1", "build-a1", "robot-a", "1.0.0", "a" * 64)
+            service.register_build("operator-1", "build-a2", "robot-a", "1.1.0", "c" * 64)
             service.publish_protocol("stat-1", protocol)
             service.create_batch("operator-1", "batch-demo", protocol["protocol_id"], protocol["version"], "build-a1")
             service.start_batch("operator-1", "batch-demo", 1)
@@ -46,11 +65,44 @@ def run(workspace: Path) -> dict[str, object]:
             service.decide(
                 "approver-1", "batch-demo", analysis["analysis_id"], decision_value, "离线验收决定"
             )
+            service.create_batch("operator-1", "batch-demo-2", protocol["protocol_id"], protocol["version"], "build-a2")
+            service.start_batch("operator-1", "batch-demo-2", 1)
+            service.import_observations(
+                "operator-1", "batch-demo-2", "demo-import-2", _improved_rows(observation_rows)
+            )
+            service.seal_batch("stat-1", "batch-demo-2", 2)
+            candidate_job = service.claim_job("worker-1", lease_seconds=60)
+            if candidate_job is None:
+                raise RuntimeError("未能领取候选批次分析任务")
+            candidate_analysis = service.complete_job("worker-1", candidate_job["job_id"], "stat-1")
+            service.decide(
+                "approver-1", "batch-demo-2", candidate_analysis["analysis_id"], "approved", "候选批次准入"
+            )
+            comparison_rules = {
+                "rules": [
+                    {"metric": "completed", "rule": "non_inferior", "margin": "0.05"},
+                    {"metric": "completion_seconds", "rule": "non_inferior", "margin": "2"},
+                    {"metric": "interventions", "rule": "non_inferior", "margin": "0.5"},
+                ]
+            }
+            comparison = service.compare_batches(
+                "stat-1", "batch-demo", "batch-demo-2",
+                analysis["analysis_id"], candidate_analysis["analysis_id"], comparison_rules,
+            )
+            replay = service.compare_batches(
+                "stat-1", "batch-demo", "batch-demo-2",
+                analysis["analysis_id"], candidate_analysis["analysis_id"], comparison_rules,
+            )
+            if replay["comparison_id"] != comparison["comparison_id"] or replay["created"]:
+                raise RuntimeError("对照结果不能幂等重算")
             report = service.report("auditor-1", "batch-demo")
+            candidate_report = service.report("auditor-1", "batch-demo-2")
+            if candidate_report["decision"]["decision"] != "approved":
+                raise RuntimeError("对照改变了候选批次的准入决定")
             schema = inspect_schema(connection)
         finally:
             connection.close()
-    if schema["missing_tables"] or schema["schema_version"] != "2":
+    if schema["missing_tables"] or schema["schema_version"] != "3":
         raise RuntimeError("SQLite 基础结构检查失败")
     return {
         "status": "ok",
@@ -60,6 +112,9 @@ def run(workspace: Path) -> dict[str, object]:
         "input_sha256": analysis["input_sha256"],
         "conclusion": analysis["result"]["conclusion"],
         "decision": report["decision"]["decision"],
+        "comparison_id": comparison["comparison_id"],
+        "comparison_conclusion": comparison["result"]["conclusion"],
+        "comparison_in_report": len(report["comparisons"]),
         "event_count": len(report["events"]),
         "schema": schema,
     }
